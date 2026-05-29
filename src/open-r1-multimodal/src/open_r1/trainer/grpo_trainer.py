@@ -65,8 +65,8 @@ from open_r1.vlm_modules.vlm_module import VLMBaseModule
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
-
-
+from qwen_vl_utils.vision_process import fetch_video
+NUM_SAMPLES = 14 # 14 for GPU A4000 48G to avoid OOM
 
 
 class RepeatRandomSampler(Sampler):
@@ -525,7 +525,7 @@ class VLMGRPOTrainer(Trainer):
         num_processes = self.accelerator.num_processes
         print(f"self.accelerator.num_processes: {self.accelerator.num_processes}")
         global_batch_size = args.per_device_train_batch_size * num_processes
-        possible_values = [n_gen for n_gen in range(2, global_batch_size + 1) if (global_batch_size) % n_gen == 0]
+        possible_values = [n_gen for n_gen in range(1, global_batch_size + 1) if (global_batch_size) % n_gen == 0]
         if self.num_generations not in possible_values:
             raise ValueError(
                 f"The global train batch size ({num_processes} x {args.per_device_train_batch_size}) must be evenly "
@@ -638,7 +638,7 @@ class VLMGRPOTrainer(Trainer):
             if "image" in x:
                 imgs = self._get_key_from_inputs(x, "image")
             elif "image_path" in x and x["image_path"] is not None:
-                imgs = [PIL.Image.open(p) for p in self._get_key_from_inputs(x, "image_path")]
+                imgs = [fetch_video({'video': p, "resized_height": 512, "resized_width": 512}) for p in self._get_key_from_inputs(x, "image_path")]
 
             for img in imgs:
                 try:
@@ -656,12 +656,26 @@ class VLMGRPOTrainer(Trainer):
                 except:
                     pass
                 images.append(img)
-                
+
+        images_sampled = []
+        for idx in range(0, len(images), self.num_generations):
+            T = images[idx].shape[0]
+            if T > NUM_SAMPLES:
+                indices = torch.randperm(T)[:NUM_SAMPLES]
+                indices = torch.sort(indices)[0]
+                for j in range(idx, idx+self.num_generations):
+                    video = images[j][indices]
+                    images_sampled.append(video)
+            else:
+                for j in range(idx, idx+self.num_generations):
+                    images_sampled.append(images[j])
+        images = images_sampled
 
         prompt_inputs = self.vlm_module.prepare_model_inputs(
             self.processing_class,
             prompts_text,
-            images,
+            images=None,
+            videos=images,
             return_tensors="pt",
             padding=True,
             padding_side="left",
@@ -707,7 +721,7 @@ class VLMGRPOTrainer(Trainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
 
         # Get the multimodal inputs
-        multimodal_keywords = self.vlm_module.get_custom_multimodal_keywords()
+        multimodal_keywords = self.vlm_module.get_custom_multimodal_keywords_videos()
         multimodal_inputs = {k: prompt_inputs[k] if k in prompt_inputs else None for k in multimodal_keywords}
         with torch.no_grad():
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip its
@@ -780,16 +794,24 @@ class VLMGRPOTrainer(Trainer):
         
         # Sum the rewards from all reward functions
         rewards = rewards_per_func.sum(dim=1)
-        
-        # Compute grouped-wise rewards
-        # Each group consists of num_generations completions for the same prompt
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
-        
-        # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+
+        if self.num_generations == 1:
+            # When training failure prediction module, we don't need to compute advantages, 
+            # and simply use the negative rewards as the loss 
+            # since we want to maximize the reward (or minimize the failure prediction score).
+            advantages = -rewards
+            mean_grouped_rewards = torch.tensor([0.0]).to(rewards.device)
+            std_grouped_rewards = torch.tensor([1.0]).to(rewards.device)
+        else:
+            # Compute grouped-wise rewards
+            # Each group consists of num_generations completions for the same prompt
+            mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+            std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+            
+            # Normalize the rewards to compute the advantages
+            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+            std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+            advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
         
         # Get only the local slice of advantages
         process_slice = slice(

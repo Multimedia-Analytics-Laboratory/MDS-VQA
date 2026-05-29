@@ -207,4 +207,6 @@ marimo/_lsp/
 __marimo__/
 ckpt/
 .gitignore
-*.md
+.vscode
+output
+candidates.json

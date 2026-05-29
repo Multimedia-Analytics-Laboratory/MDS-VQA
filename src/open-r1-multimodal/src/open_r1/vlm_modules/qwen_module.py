@@ -15,7 +15,7 @@ class Qwen2VLModule(VLMBaseModule):
     def get_model_class(self, model_id: str, model_init_kwargs: dict):
         if "Qwen2-VL" in model_id:
             model_cls = Qwen2VLForConditionalGeneration
-        elif "Qwen2.5-VL" in model_id:
+        elif "Qwen2.5-VL" or "VQR1" in model_id:
             model_cls = Qwen2_5_VLForConditionalGeneration
         else:
             raise ValueError(f"Unsupported model: {model_id}")
@@ -33,6 +33,9 @@ class Qwen2VLModule(VLMBaseModule):
     def get_custom_multimodal_keywords(self):
         return ['pixel_values', 'image_grid_thw']
 
+    def get_custom_multimodal_keywords_videos(self):
+        return ['pixel_values_videos', 'video_grid_thw']
+    
     def get_non_generate_params(self):
         return []
     
@@ -43,13 +46,14 @@ class Qwen2VLModule(VLMBaseModule):
         prompts_text = [maybe_apply_chat_template(example, processing_class)["prompt"] for example in inputs]
         return prompts_text
     
-    def prepare_model_inputs(self, processing_class, prompts_text, images, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False):
+    def prepare_model_inputs(self, processing_class, prompts_text, images, videos=None, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False):
         # FIXME
         # This could only process pure-multimodal or pure-text inputs
-        if len(images) > 0:
+        if (images and len(images) > 0) or (videos and len(videos) > 0):
             prompt_inputs = processing_class(
                 text=prompts_text,
                 images=images,
+                videos=videos,
                 return_tensors=return_tensors,
                 padding=padding,
                 padding_side=padding_side,
@@ -67,6 +71,8 @@ class Qwen2VLModule(VLMBaseModule):
     def get_question_template(task_type: str):
         if task_type == "scoring":
             return "{Question} First output the thinking process in <think> </think> tags and then output the final answer with only one score in <answer> </answer> tags."
+        elif task_type == "only_scoring":
+            return "{Question} Please only output the final answer with only one score in <answer> </answer> tags."
         else:
             raise ValueError("Choose scoring or comparing...")
             

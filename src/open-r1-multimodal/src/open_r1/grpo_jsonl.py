@@ -46,6 +46,13 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from openai import OpenAI
 
+from deepspeed.runtime.fp16.loss_scaler import LossScaler
+from deepspeed.runtime.zero.config import ZeroStageEnum
+from deepspeed.utils.tensor_fragment import fragment_address
+torch.serialization.add_safe_globals([LossScaler])
+torch.serialization.add_safe_globals([ZeroStageEnum])
+torch.serialization.add_safe_globals([fragment_address])
+
 logger = logging.get_logger(__name__)
 
 client = OpenAI(
@@ -139,6 +146,20 @@ def fidelity_reward(pred1, pred2, var1, var2, gt, device):
     return reward
 
 
+def fidelity_loss(pred1, pred2, var1, var2, gt, device):
+    esp = 1e-6
+    try:
+        normal_dist = torch.distributions.Normal(0, 1)
+        _cur = (pred1 - pred2) / torch.sqrt(var1 + var2 + esp)
+        p = normal_dist.cdf(_cur)
+    except:
+        print("Meet Error ...")
+        p = torch.tensor(0.5, dtype=torch.float32, device=device)
+    
+    reward = 1 - torch.sqrt(p * gt + esp) - torch.sqrt((1 - p) * (1 - gt) + esp)
+    return reward
+
+
 def accuracy_reward(completions, solution, **kwargs):
     """Reward function that checks if the completion is correct using symbolic verification, exact string matching, or fuzzy matching."""
     device = kwargs.get("device")
@@ -225,6 +246,80 @@ def accuracy_reward(completions, solution, **kwargs):
     return rewards
 
 
+def accuracy_loss_difficult(completions, solution, **kwargs):
+    device = kwargs.get("device")
+    n_gen = kwargs.get("num_generations")
+
+    assert n_gen == 1, "Number of generations should be 1 when training failure predictor"
+
+    # extract predictions
+    predictions = kwargs.get("prediction")
+
+    # extract content
+    contents = [completion[0]["content"] for completion in completions]
+
+    batch_solution = []
+    for i in range(len(solution)):
+        _cur = solution[i]
+        sol_match = re.search(r'<answer>(.*?)</answer>', _cur)
+        ground_truth = sol_match.group(1).strip() if sol_match else sol_match.strip()
+        batch_solution.append(float(ground_truth))
+
+    batch_pred = []
+    for i in range(len(contents)): # batch
+        try:
+            content_matches = re.findall(r'<answer>(.*?)</answer>', contents[i], re.DOTALL)
+            student_answer = content_matches[-1].strip() if content_matches else contents[i].strip()
+            pred = extract_first_number(student_answer)
+        except:
+            print("Meet Error ...")
+            pred = random.uniform(1, 5)
+        batch_pred.append(pred)
+    
+    rewards = []
+    for i in range(len(batch_pred)):
+        _reward_sum, _count_idx = 0, 0
+        for j in range(len(batch_pred)):
+            if j != i:
+                input_pred1 = batch_pred[i]
+                input_pred2 = batch_pred[j]
+
+                diff_mos1 = abs(predictions[i]-batch_solution[i])
+                diff_mos2 = abs(predictions[j]-batch_solution[j])
+
+                if diff_mos1 >= diff_mos2:
+                    input_gt = torch.tensor(1.0, dtype=torch.float32, device=device)
+                else:
+                    input_gt = torch.tensor(0.0, dtype=torch.float32, device=device)
+
+                _reward = fidelity_loss(
+                    pred1=input_pred1, pred2=input_pred2, var1=torch.tensor(1.0), 
+                    var2=torch.tensor(1.0), gt=input_gt, device=device
+                )
+
+                _reward_sum = _reward_sum + _reward
+                _count_idx = _count_idx + 1
+
+        _cur_reward = _reward_sum / _count_idx
+        rewards.append(_cur_reward)
+
+        if os.getenv("DEBUG_MODE") == "true":
+            log_path = os.getenv("LOG_PATH")
+            current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
+            image_path = kwargs.get("image_path") if "image_path" in kwargs else None
+            problem = kwargs.get("problem")[0]
+
+            with open(log_path, "a", encoding='utf-8') as f:
+                f.write(f"------------- {current_time} Accuracy reward: {_cur_reward} -------------\n")
+                f.write(f"accu_reward_method: {_cur_reward}\n")
+                f.write(f"image_path: {image_path[i]}\n")
+                f.write(f"problem: {problem}\n")
+                f.write(f"Content: {contents[i]}\n")
+                f.write(f"Solution: {solution[i]}\n") 
+
+    return rewards
+
+
 def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
     pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
@@ -243,7 +338,27 @@ def format_reward(completions, **kwargs):
     return [1.0 if match else 0.0 for match in matches]
 
 
+def format_reward_difficult(completions, **kwargs):
+    """Reward function that checks if the completion has a specific format."""
+    pattern = r"<answer>.*?</answer>"
+    completion_contents = [completion[0]["content"] for completion in completions]
+    matches = [re.fullmatch(pattern, content, re.DOTALL) for content in completion_contents]
+
+    current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
+    if os.getenv("DEBUG_MODE") == "true":
+        log_path = os.getenv("LOG_PATH")
+        with open(log_path.replace(".txt", "_format.txt"), "a", encoding='utf-8') as f:
+            f.write(f"------------- {current_time} Format reward -------------\n")
+            for content, match in zip(completion_contents, matches):
+                f.write(f"Content: {content}\n")
+                f.write(f"Has format: {bool(match)}\n")
+
+    return [0.0 if match else 1.0 for match in matches]
+
+
 reward_funcs_registry = {
+    "accuracy_loss_difficult": accuracy_loss_difficult,
+    "format_loss_difficult": format_reward_difficult,
     "accuracy": accuracy_reward,
     "format": format_reward
 }
@@ -254,7 +369,7 @@ class GRPOModelConfig(ModelConfig):
 
 
 def get_vlm_module(model_name_or_path):
-    if "qwen" in model_name_or_path.lower():
+    if "qwen" or 'vqr1' in model_name_or_path.lower():
         return Qwen2VLModule
     elif "internvl" in model_name_or_path.lower():
         return InvernVLModule
@@ -320,6 +435,8 @@ def main(script_args, training_args, model_args):
                     # If it's a float or other non-string type, keep it as is
                     item['solution'] = str(solution_value)
                 
+                if 'predictions' in item['conversations'][1]:
+                    item['prediction'] = item['conversations'][1]['predictions']
                 del item['conversations']
                 item['accu_reward_method'] = item.get('accu_reward_method', accu_reward_method) # if accu_reward_method is in the data jsonl, use the value in the data jsonl, otherwise use the defined value
                 all_data.append(item)
@@ -335,10 +452,11 @@ def main(script_args, training_args, model_args):
                 'problem': example['problem'],
                 'solution': f"<answer> {example['solution']} </answer>",
                 'accu_reward_method': example['accu_reward_method'],
+                'prediction': example['prediction'] if 'prediction' in example else None,
                 'prompt': [{
                     'role': 'user',
                     'content': [
-                        *({'type': 'image', 'text': None} for _ in range(len(example['image_path']))),
+                        *({'type': 'video', 'text': None} for _ in range(len(example['image_path']))),
                         {'type': 'text', 'text': question_prompt.format(Question=example['problem'])}
                     ]
                 }]

@@ -249,7 +249,7 @@ def normalize(input_file, output_file, dataset_name):
 
 
 if __name__ == "__main__":
-    dataset_name = "KADID-10K"
+    dataset_name = ""
 
     # Norm
     input_file = f"./{dataset_name}/{dataset_name}_mos.txt"
